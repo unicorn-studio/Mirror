@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using Mirror.RemoteCalls;
+using System.Runtime.CompilerServices;
 using UnityEngine;
 
 namespace Mirror
@@ -187,14 +187,15 @@ namespace Mirror
             syncObject.IsRecording = () => netIdentity.observers?.Count > 0;
         }
 
-        protected void SendCommandInternal(Type invokeClass, string cmdName, NetworkWriter writer, int channelId, bool requiresAuthority = true)
+        // pass full function name to avoid ClassA.Func <-> ClassB.Func collisions
+        protected void SendCommandInternal(string functionFullName, NetworkWriter writer, int channelId, bool requiresAuthority = true)
         {
             // this was in Weaver before
             // NOTE: we could remove this later to allow calling Cmds on Server
             //       to avoid Wrapper functions. a lot of people requested this.
             if (!NetworkClient.active)
             {
-                Debug.LogError($"Command Function {cmdName} called without an active client.");
+                Debug.LogError($"Command Function {functionFullName} called without an active client.");
                 return;
             }
 
@@ -213,7 +214,7 @@ namespace Mirror
             // local players can always send commands, regardless of authority, other objects must have authority.
             if (!(!requiresAuthority || isLocalPlayer || hasAuthority))
             {
-                Debug.LogWarning($"Trying to send command for object without authority. {invokeClass}.{cmdName}");
+                Debug.LogWarning($"Trying to send command for object without authority. {functionFullName}");
                 return;
             }
 
@@ -234,7 +235,7 @@ namespace Mirror
                 netId = netId,
                 componentIndex = (byte)ComponentIndex,
                 // type+func so Inventory.RpcUse != Equipment.RpcUse
-                functionHash = RemoteCallHelper.GetMethodHash(invokeClass, cmdName),
+                functionHash = functionFullName.GetStableHashCode(),
                 // segment to avoid reader allocations
                 payload = writer.ToArraySegment()
             };
@@ -247,19 +248,20 @@ namespace Mirror
             NetworkClient.connection.Send(message, channelId);
         }
 
-        protected void SendRPCInternal(Type invokeClass, string rpcName, NetworkWriter writer, int channelId, bool includeOwner)
+        // pass full function name to avoid ClassA.Func <-> ClassB.Func collisions
+        protected void SendRPCInternal(string functionFullName, NetworkWriter writer, int channelId, bool includeOwner)
         {
             // this was in Weaver before
             if (!NetworkServer.active)
             {
-                Debug.LogError($"RPC Function {rpcName} called on Client.");
+                Debug.LogError($"RPC Function {functionFullName} called on Client.");
                 return;
             }
 
             // This cannot use NetworkServer.active, as that is not specific to this object.
             if (!isServer)
             {
-                Debug.LogWarning($"ClientRpc {rpcName} called on un-spawned object: {name}");
+                Debug.LogWarning($"ClientRpc {functionFullName} called on un-spawned object: {name}");
                 return;
             }
 
@@ -269,7 +271,7 @@ namespace Mirror
                 netId = netId,
                 componentIndex = (byte)ComponentIndex,
                 // type+func so Inventory.RpcUse != Equipment.RpcUse
-                functionHash = RemoteCallHelper.GetMethodHash(invokeClass, rpcName),
+                functionHash = functionFullName.GetStableHashCode(),
                 // segment to avoid reader allocations
                 payload = writer.ToArraySegment()
             };
@@ -277,17 +279,18 @@ namespace Mirror
             NetworkServer.SendToReadyObservers(netIdentity, message, includeOwner, channelId);
         }
 
-        protected void SendTargetRPCInternal(NetworkConnection conn, Type invokeClass, string rpcName, NetworkWriter writer, int channelId)
+        // pass full function name to avoid ClassA.Func <-> ClassB.Func collisions
+        protected void SendTargetRPCInternal(NetworkConnection conn, string functionFullName, NetworkWriter writer, int channelId)
         {
             if (!NetworkServer.active)
             {
-                Debug.LogError($"TargetRPC {rpcName} called when server not active");
+                Debug.LogError($"TargetRPC {functionFullName} called when server not active");
                 return;
             }
 
             if (!isServer)
             {
-                Debug.LogWarning($"TargetRpc {rpcName} called on {name} but that object has not been spawned or has been unspawned");
+                Debug.LogWarning($"TargetRpc {functionFullName} called on {name} but that object has not been spawned or has been unspawned");
                 return;
             }
 
@@ -300,13 +303,13 @@ namespace Mirror
             // if still null
             if (conn is null)
             {
-                Debug.LogError($"TargetRPC {rpcName} was given a null connection, make sure the object has an owner or you pass in the target connection");
+                Debug.LogError($"TargetRPC {functionFullName} was given a null connection, make sure the object has an owner or you pass in the target connection");
                 return;
             }
 
             if (!(conn is NetworkConnectionToClient))
             {
-                Debug.LogError($"TargetRPC {rpcName} requires a NetworkConnectionToClient but was given {conn.GetType().Name}");
+                Debug.LogError($"TargetRPC {functionFullName} requires a NetworkConnectionToClient but was given {conn.GetType().Name}");
                 return;
             }
 
@@ -316,12 +319,137 @@ namespace Mirror
                 netId = netId,
                 componentIndex = (byte)ComponentIndex,
                 // type+func so Inventory.RpcUse != Equipment.RpcUse
-                functionHash = RemoteCallHelper.GetMethodHash(invokeClass, rpcName),
+                functionHash = functionFullName.GetStableHashCode(),
                 // segment to avoid reader allocations
                 payload = writer.ToArraySegment()
             };
 
             conn.Send(message, channelId);
+        }
+
+        // move the [SyncVar] generated property's .set into C# to avoid much IL
+        //
+        //   public int health = 42;
+        //
+        //   public int Networkhealth
+        //   {
+        //       get
+        //       {
+        //           return health;
+        //       }
+        //       [param: In]
+        //       set
+        //       {
+        //           if (!NetworkBehaviour.SyncVarEqual(value, ref health))
+        //           {
+        //               int oldValue = health;
+        //               SetSyncVar(value, ref health, 1uL);
+        //               if (NetworkServer.localClientActive && !GetSyncVarHookGuard(1uL))
+        //               {
+        //                   SetSyncVarHookGuard(1uL, value: true);
+        //                   OnChanged(oldValue, value);
+        //                   SetSyncVarHookGuard(1uL, value: false);
+        //               }
+        //           }
+        //       }
+        //   }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void GeneratedSyncVarSetter<T>(T value, ref T field, ulong dirtyBit, Action<T, T> OnChanged)
+        {
+            if (!SyncVarEqual(value, ref field))
+            {
+                T oldValue = field;
+                SetSyncVar(value, ref field, dirtyBit);
+
+                // call hook (if any)
+                if (OnChanged != null)
+                {
+                    // we use hook guard to protect against deadlock where hook
+                    // changes syncvar, calling hook again.
+                    if (NetworkServer.localClientActive && !GetSyncVarHookGuard(dirtyBit))
+                    {
+                        SetSyncVarHookGuard(dirtyBit, true);
+                        OnChanged(oldValue, value);
+                        SetSyncVarHookGuard(dirtyBit, false);
+                    }
+                }
+            }
+        }
+
+        // GameObject needs custom handling for persistence via netId.
+        // has one extra parameter.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void GeneratedSyncVarSetter_GameObject(GameObject value, ref GameObject field, ulong dirtyBit, Action<GameObject, GameObject> OnChanged, ref uint netIdField)
+        {
+            if (!SyncVarGameObjectEqual(value, netIdField))
+            {
+                GameObject oldValue = field;
+                SetSyncVarGameObject(value, ref field, dirtyBit, ref netIdField);
+
+                // call hook (if any)
+                if (OnChanged != null)
+                {
+                    // we use hook guard to protect against deadlock where hook
+                    // changes syncvar, calling hook again.
+                    if (NetworkServer.localClientActive && !GetSyncVarHookGuard(dirtyBit))
+                    {
+                        SetSyncVarHookGuard(dirtyBit, true);
+                        OnChanged(oldValue, value);
+                        SetSyncVarHookGuard(dirtyBit, false);
+                    }
+                }
+            }
+        }
+
+        // NetworkIdentity needs custom handling for persistence via netId.
+        // has one extra parameter.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void GeneratedSyncVarSetter_NetworkIdentity(NetworkIdentity value, ref NetworkIdentity field, ulong dirtyBit, Action<NetworkIdentity, NetworkIdentity> OnChanged, ref uint netIdField)
+        {
+            if (!SyncVarNetworkIdentityEqual(value, netIdField))
+            {
+                NetworkIdentity oldValue = field;
+                SetSyncVarNetworkIdentity(value, ref field, dirtyBit, ref netIdField);
+
+                // call hook (if any)
+                if (OnChanged != null)
+                {
+                    // we use hook guard to protect against deadlock where hook
+                    // changes syncvar, calling hook again.
+                    if (NetworkServer.localClientActive && !GetSyncVarHookGuard(dirtyBit))
+                    {
+                        SetSyncVarHookGuard(dirtyBit, true);
+                        OnChanged(oldValue, value);
+                        SetSyncVarHookGuard(dirtyBit, false);
+                    }
+                }
+            }
+        }
+
+        // NetworkBehaviour needs custom handling for persistence via netId.
+        // has one extra parameter.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void GeneratedSyncVarSetter_NetworkBehaviour<T>(T value, ref T field, ulong dirtyBit, Action<T, T> OnChanged, ref NetworkBehaviourSyncVar netIdField)
+            where T : NetworkBehaviour
+        {
+            if (!SyncVarNetworkBehaviourEqual(value, netIdField))
+            {
+                T oldValue = field;
+                SetSyncVarNetworkBehaviour(value, ref field, dirtyBit, ref netIdField);
+
+                // call hook (if any)
+                if (OnChanged != null)
+                {
+                    // we use hook guard to protect against deadlock where hook
+                    // changes syncvar, calling hook again.
+                    if (NetworkServer.localClientActive && !GetSyncVarHookGuard(dirtyBit))
+                    {
+                        SetSyncVarHookGuard(dirtyBit, true);
+                        OnChanged(oldValue, value);
+                        SetSyncVarHookGuard(dirtyBit, false);
+                    }
+                }
+            }
         }
 
         // helper function for [SyncVar] GameObjects.
@@ -698,6 +826,9 @@ namespace Mirror
 
         /// <summary>Like Start(), but only called on client and host for the local player object.</summary>
         public virtual void OnStartLocalPlayer() {}
+
+        /// <summary>Stop event, but only called on client and host for the local player object.</summary>
+        public virtual void OnStopLocalPlayer() {}
 
         /// <summary>Like Start(), but only called for objects the client has authority over.</summary>
         public virtual void OnStartAuthority() {}
