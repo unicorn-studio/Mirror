@@ -1,0 +1,9 @@
+{
+    "name": "com.vis2k.mirror",
+    "displayName": "Mirror",
+    "version": "52.0.1",
+    "unity": "2020.3",
+    "description": "Mirror for Unity",
+    "license": "MIT",
+    "dependencies": {}
+}
